@@ -1,5 +1,6 @@
 import base64
-import json
+import os
+from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -15,6 +16,290 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# ---------------------------------------------------------------------------
+# Self-bootstrapping components.
+#
+# Streamlit components with a real return value (not a CSS/DOM hack) need a
+# tiny static index.html file living in its own folder. To keep this whole
+# app a single file to manage, we just write those helper files out to a
+# hidden folder next to this script the first time it runs (idempotent —
+# safe to run every time, it just rewrites the same small files).
+# ---------------------------------------------------------------------------
+_BASE_DIR = Path(__file__).resolve().parent
+_COMPONENTS_DIR = _BASE_DIR / ".organize_pdf_components"
+_DRAG_GRID_DIR = _COMPONENTS_DIR / "drag_grid"
+_STATE_BRIDGE_DIR = _COMPONENTS_DIR / "state_bridge"
+
+_DRAG_GRID_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: transparent;
+  }
+  #grid {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 14px;
+    padding: 4px;
+  }
+  .card {
+    border: 2px solid #f43f5e;
+    border-radius: 12px;
+    background: #fff;
+    padding: 8px;
+    box-sizing: border-box;
+    text-align: center;
+    cursor: grab;
+    box-shadow: 0 1px 4px rgba(244,63,94,0.1);
+    transition: box-shadow 0.15s ease, background-color 0.15s ease, opacity 0.15s ease;
+    user-select: none;
+  }
+  .card:hover {
+    box-shadow: 0 6px 18px rgba(244,63,94,0.2);
+    background-color: #fff1f2;
+  }
+  .card.dragging {
+    opacity: 0.4;
+  }
+  .thumb-wrap {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  .thumb-wrap img {
+    max-width: 100%;
+    max-height: 100%;
+    pointer-events: none;
+  }
+  .num {
+    margin-top: 6px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #666;
+  }
+  #apply-btn {
+    margin-top: 14px;
+    background-color: #111;
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    font-weight: 500;
+    padding: 10px 18px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  #apply-btn:hover {
+    background-color: #333;
+  }
+  #status {
+    display: inline-block;
+    margin-left: 10px;
+    font-size: 0.8rem;
+  }
+</style>
+</head>
+<body>
+  <div id="grid"></div>
+  <button id="apply-btn">Apply order &darr;</button>
+  <span id="status"></span>
+
+  <script>
+    function sendMessageToStreamlitClient(type, data) {
+      var outData = Object.assign({ isStreamlitMessage: true, type: type }, data);
+      window.parent.postMessage(outData, "*");
+    }
+    function componentReady() {
+      sendMessageToStreamlitClient("streamlit:componentReady", { apiVersion: 1 });
+    }
+    function setFrameHeight(height) {
+      sendMessageToStreamlitClient("streamlit:setFrameHeight", { height: height });
+    }
+    function sendValue(value) {
+      sendMessageToStreamlitClient("streamlit:setComponentValue", { value: value, dataType: "json" });
+    }
+
+    let dragEl = null;
+
+    function renumber() {
+      Array.from(document.querySelectorAll('.card')).forEach((c, i) => {
+        c.querySelector('.num').textContent = (i + 1);
+      });
+    }
+
+    function attachDnD() {
+      const grid = document.getElementById('grid');
+      Array.from(grid.querySelectorAll('.card')).forEach(card => {
+        card.addEventListener('dragstart', () => {
+          dragEl = card;
+          setTimeout(() => card.classList.add('dragging'), 0);
+        });
+        card.addEventListener('dragend', () => {
+          card.classList.remove('dragging');
+          dragEl = null;
+          renumber();
+          updateHeight();
+        });
+        card.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          if (!dragEl || dragEl === card) return;
+          const rect = card.getBoundingClientRect();
+          const before = e.clientX < rect.left + rect.width / 2;
+          grid.insertBefore(dragEl, before ? card : card.nextSibling);
+        });
+      });
+      grid.addEventListener('dragover', (e) => e.preventDefault());
+      grid.addEventListener('drop', (e) => e.preventDefault());
+    }
+
+    function updateHeight() {
+      requestAnimationFrame(() => {
+        setFrameHeight(document.body.scrollHeight + 16);
+      });
+    }
+
+    function renderGrid(pages, width) {
+      const cardWidth = width || 110;
+      const cardH = Math.round(cardWidth * 1.3);
+      const grid = document.getElementById('grid');
+      grid.innerHTML = '';
+      pages.forEach(p => {
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.draggable = true;
+        card.dataset.page = p.page;
+        card.style.width = (cardWidth + 20) + 'px';
+
+        const thumbWrap = document.createElement('div');
+        thumbWrap.className = 'thumb-wrap';
+        thumbWrap.style.height = cardH + 'px';
+        if (p.thumb) {
+          const img = document.createElement('img');
+          img.src = p.thumb;
+          img.draggable = false;
+          thumbWrap.appendChild(img);
+        }
+
+        const num = document.createElement('div');
+        num.className = 'num';
+
+        card.appendChild(thumbWrap);
+        card.appendChild(num);
+        grid.appendChild(card);
+      });
+      attachDnD();
+      renumber();
+      updateHeight();
+    }
+
+    document.getElementById('apply-btn').addEventListener('click', () => {
+      const cards = Array.from(document.querySelectorAll('.card'));
+      const order = cards.map(c => parseInt(c.dataset.page, 10));
+      sendValue(order);
+      const status = document.getElementById('status');
+      status.style.color = '#16a34a';
+      status.textContent = 'Order applied \u2713';
+      setTimeout(() => { status.textContent = ''; }, 2500);
+    });
+
+    window.addEventListener('message', (event) => {
+      if (!event.data || event.data.type !== 'streamlit:render') return;
+      const args = event.data.args || {};
+      renderGrid(args.pages || [], args.thumb_width || 110);
+    });
+
+    componentReady();
+    setFrameHeight(200);
+  </script>
+</body>
+</html>
+"""
+
+_STATE_BRIDGE_HTML = r"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8" /></head>
+<body>
+<script>
+  function sendMessageToStreamlitClient(type, data) {
+    var outData = Object.assign({ isStreamlitMessage: true, type: type }, data);
+    window.parent.postMessage(outData, "*");
+  }
+  function componentReady() {
+    sendMessageToStreamlitClient("streamlit:componentReady", { apiVersion: 1 });
+    sendMessageToStreamlitClient("streamlit:setFrameHeight", { height: 0 });
+  }
+  function sendValue(value) {
+    sendMessageToStreamlitClient("streamlit:setComponentValue", { value: value, dataType: "json" });
+  }
+
+  const STORAGE_KEY = "organize_pdf_state_v1";
+  let restored = false;
+
+  window.addEventListener('message', (event) => {
+    if (!event.data || event.data.type !== 'streamlit:render') return;
+    const args = event.data.args || {};
+
+    if (!restored) {
+      restored = true;
+      let existing = null;
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) existing = JSON.parse(raw);
+      } catch (e) {
+        existing = null;
+      }
+      sendValue(existing);
+    }
+
+    if (args.clear) {
+      try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+    } else if (args.state !== null && args.state !== undefined) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(args.state));
+      } catch (e) {
+        // storage full or unavailable - fail silently, app still works without persistence
+      }
+    }
+  });
+
+  componentReady();
+</script>
+</body>
+</html>
+"""
+
+
+def _bootstrap_components():
+    for d in (_DRAG_GRID_DIR, _STATE_BRIDGE_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    (_DRAG_GRID_DIR / "index.html").write_text(_DRAG_GRID_HTML, encoding="utf-8")
+    (_STATE_BRIDGE_DIR / "index.html").write_text(_STATE_BRIDGE_HTML, encoding="utf-8")
+
+
+_bootstrap_components()
+
+_drag_grid_component = components.declare_component("drag_grid", path=str(_DRAG_GRID_DIR))
+_state_bridge_component = components.declare_component("state_bridge", path=str(_STATE_BRIDGE_DIR))
+
+
+def drag_grid(pages, thumb_width=110, key=None):
+    return _drag_grid_component(pages=pages, thumb_width=thumb_width, key=key, default=None)
+
+
+def state_bridge(state=None, clear=False, key=None):
+    return _state_bridge_component(state=state, clear=clear, key=key, default=None)
+
+
+# ---------------------------------------------------------------------------
+# Styling
+# ---------------------------------------------------------------------------
 st.markdown(
     """
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
@@ -73,30 +358,22 @@ st.markdown(
         font-size: 0.85rem;
         margin: 6px 0;
     }
-    /* Hide the sync field used to receive the drag order from the component */
-    div[data-testid="stTextInput"]:has(input[aria-label="__order_sync__"]) {
-        position: absolute !important;
-        width: 1px !important;
-        height: 1px !important;
-        padding: 0 !important;
-        margin: -1px !important;
-        overflow: hidden !important;
-        opacity: 0 !important;
-        pointer-events: none;
-    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+# ---------------------------------------------------------------------------
+# Session state defaults
+# ---------------------------------------------------------------------------
 if "pdf_bytes" not in st.session_state:
     st.session_state.pdf_bytes = None
 if "page_order" not in st.session_state:
     st.session_state.page_order = []
 if "filename" not in st.session_state:
     st.session_state.filename = "document.pdf"
-if "order_sync_last" not in st.session_state:
-    st.session_state.order_sync_last = ""
+if "hydrated" not in st.session_state:
+    st.session_state.hydrated = False
 
 
 def load_pdf(uploaded_file):
@@ -144,178 +421,36 @@ def image_to_data_uri(img):
     return f"data:image/png;base64,{b64}"
 
 
-def build_drag_grid_html(pdf_bytes, order, thumb_width=110):
-    """Self-contained HTML5 drag-and-drop grid. Each card carries its own
-    real thumbnail image and page-index — nothing is derived from sibling
-    position, so nothing can glitch or mismatch while dragging."""
-    card_h = int(thumb_width * 1.3)
-    cards_html = []
-    for page_idx in order:
-        thumb = render_thumbnail(pdf_bytes, page_idx, max_width=thumb_width)
-        img_tag = (
-            f'<img src="{image_to_data_uri(thumb)}" draggable="false" />'
-            if thumb is not None
-            else ""
-        )
-        cards_html.append(
-            f'<div class="card" draggable="true" data-page="{page_idx}">'
-            f'<div class="thumb-wrap">{img_tag}</div>'
-            f'<div class="num"></div>'
-            f"</div>"
-        )
-    cards_joined = "\n".join(cards_html)
+# ---------------------------------------------------------------------------
+# Persistence: restore once on a fresh session, then keep localStorage synced
+# with the current state on every rerun so a full page reload isn't a reset.
+# ---------------------------------------------------------------------------
+_persist_state = None
+if st.session_state.pdf_bytes is not None:
+    _persist_state = {
+        "pdf_b64": base64.b64encode(st.session_state.pdf_bytes).decode(),
+        "filename": st.session_state.filename,
+        "page_order": st.session_state.page_order,
+    }
 
-    return f"""
-    <html>
-    <head>
-    <style>
-        html, body {{
-            margin: 0; padding: 0;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: transparent;
-        }}
-        #grid {{
-            display: flex;
-            flex-direction: row;
-            flex-wrap: wrap;
-            gap: 14px;
-            padding: 4px;
-        }}
-        .card {{
-            width: {thumb_width + 20}px;
-            border: 2px solid #f43f5e;
-            border-radius: 12px;
-            background: #fff;
-            padding: 8px;
-            box-sizing: border-box;
-            text-align: center;
-            cursor: grab;
-            box-shadow: 0 1px 4px rgba(244,63,94,0.1);
-            transition: box-shadow 0.15s ease, background-color 0.15s ease, opacity 0.15s ease;
-            user-select: none;
-        }}
-        .card:hover {{
-            box-shadow: 0 6px 18px rgba(244,63,94,0.2);
-            background-color: #fff1f2;
-        }}
-        .card.dragging {{
-            opacity: 0.4;
-        }}
-        .thumb-wrap {{
-            width: 100%;
-            height: {card_h}px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            overflow: hidden;
-        }}
-        .thumb-wrap img {{
-            max-width: 100%;
-            max-height: 100%;
-            pointer-events: none;
-        }}
-        .num {{
-            margin-top: 6px;
-            font-family: 'Geist Mono', 'Courier New', monospace;
-            font-size: 0.8rem;
-            font-weight: 600;
-            color: #666;
-        }}
-        #apply-btn {{
-            margin-top: 14px;
-            background-color: #111;
-            color: #fff;
-            border: none;
-            border-radius: 10px;
-            font-weight: 500;
-            padding: 10px 18px;
-            cursor: pointer;
-            font-size: 0.9rem;
-        }}
-        #apply-btn:hover {{
-            background-color: #333;
-        }}
-        #status {{
-            display: inline-block;
-            margin-left: 10px;
-            font-size: 0.8rem;
-            color: #16a34a;
-        }}
-    </style>
-    </head>
-    <body>
-        <div id="grid">
-            {cards_joined}
-        </div>
-        <button id="apply-btn">Apply order ↓</button>
-        <span id="status"></span>
+_restored = state_bridge(state=_persist_state, key="state_bridge_widget")
 
-        <script>
-        const grid = document.getElementById('grid');
-        let dragEl = null;
-
-        function renumber() {{
-            Array.from(grid.querySelectorAll('.card')).forEach((c, i) => {{
-                c.querySelector('.num').textContent = (i + 1);
-            }});
-        }}
-
-        Array.from(grid.querySelectorAll('.card')).forEach(card => {{
-            card.addEventListener('dragstart', () => {{
-                dragEl = card;
-                setTimeout(() => card.classList.add('dragging'), 0);
-            }});
-            card.addEventListener('dragend', () => {{
-                card.classList.remove('dragging');
-                dragEl = null;
-                renumber();
-            }});
-            card.addEventListener('dragover', (e) => {{
-                e.preventDefault();
-                if (!dragEl || dragEl === card) return;
-                const rect = card.getBoundingClientRect();
-                const before = e.clientX < rect.left + rect.width / 2;
-                grid.insertBefore(dragEl, before ? card : card.nextSibling);
-            }});
-        }});
-        grid.addEventListener('dragover', (e) => e.preventDefault());
-        grid.addEventListener('drop', (e) => e.preventDefault());
-
-        renumber();
-
-        document.getElementById('apply-btn').addEventListener('click', () => {{
-            const status = document.getElementById('status');
-            try {{
-                const cards = Array.from(grid.querySelectorAll('.card'));
-                const order = cards.map(c => c.getAttribute('data-page'));
-                const orderJson = JSON.stringify(order);
-
-                const doc = window.parent.document;
-                const input = doc.querySelector('input[aria-label="__order_sync__"]');
-                if (!input) {{
-                    status.style.color = '#dc2626';
-                    status.textContent = 'Could not sync — reload the page.';
-                    return;
-                }}
-                const setter = Object.getOwnPropertyDescriptor(
-                    window.parent.HTMLInputElement.prototype, 'value'
-                ).set;
-                setter.call(input, orderJson);
-                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                input.blur();
-                status.style.color = '#16a34a';
-                status.textContent = 'Order applied ✓';
-            }} catch (err) {{
-                status.style.color = '#dc2626';
-                status.textContent = 'Sync error: ' + err.message;
-            }}
-        }});
-        </script>
-    </body>
-    </html>
-    """
-
+if not st.session_state.hydrated:
+    st.session_state.hydrated = True
+    if _restored and st.session_state.pdf_bytes is None:
+        try:
+            pdf_bytes = base64.b64decode(_restored["pdf_b64"])
+            reader = PdfReader(BytesIO(pdf_bytes))
+            n_pages = len(reader.pages)
+            saved_order = _restored.get("page_order")
+            if not (isinstance(saved_order, list) and set(saved_order) == set(range(n_pages))):
+                saved_order = list(range(n_pages))
+            st.session_state.pdf_bytes = pdf_bytes
+            st.session_state.filename = _restored.get("filename", "document.pdf")
+            st.session_state.page_order = saved_order
+            st.rerun()
+        except Exception:
+            pass
 
 left, right = st.columns([3.2, 1.1], gap="large")
 
@@ -361,6 +496,13 @@ with right:
         if st.button("Reset all", use_container_width=True, key="reset_btn"):
             reader = get_reader()
             st.session_state.page_order = list(range(len(reader.pages)))
+            st.rerun()
+
+        if st.button("Clear saved copy", use_container_width=True, key="clear_saved_btn"):
+            state_bridge(clear=True, key="state_bridge_clear")
+            st.session_state.pdf_bytes = None
+            st.session_state.page_order = []
+            st.session_state.filename = "document.pdf"
             st.rerun()
 
     st.markdown("---")
@@ -453,26 +595,31 @@ with left:
         unsafe_allow_html=True,
     )
 
-    # Rows needed for a rough height estimate (actual wrapping is responsive).
-    approx_cols = 8
-    rows = max(1, -(-n // approx_cols))
-    grid_height = rows * 190 + 90
+    pages_payload = []
+    for page_idx in order:
+        thumb = render_thumbnail(st.session_state.pdf_bytes, page_idx, max_width=110)
+        pages_payload.append(
+            {
+                "page": page_idx,
+                "thumb": image_to_data_uri(thumb) if thumb is not None else None,
+            }
+        )
 
-    grid_html = build_drag_grid_html(st.session_state.pdf_bytes, order, thumb_width=110)
-    components.html(grid_html, height=grid_height, scrolling=True)
+    result = drag_grid(pages_payload, thumb_width=110, key="drag_grid_widget")
 
-    sync_value = st.text_input(
-        "__order_sync__", key="order_sync", label_visibility="collapsed"
-    )
-    if sync_value and sync_value != st.session_state.order_sync_last:
+    if result is not None:
         try:
-            new_order = [int(x) for x in json.loads(sync_value)]
-            if len(new_order) == len(order) and set(new_order) == set(order):
-                st.session_state.order_sync_last = sync_value
-                st.session_state.page_order = new_order
-                st.rerun()
-        except (ValueError, TypeError, json.JSONDecodeError):
-            pass
+            new_order = [int(x) for x in result]
+        except (TypeError, ValueError):
+            new_order = None
+        if (
+            new_order is not None
+            and len(new_order) == len(order)
+            and set(new_order) == set(order)
+            and new_order != st.session_state.page_order
+        ):
+            st.session_state.page_order = new_order
+            st.rerun()
 
     st.markdown("---")
     st.markdown(

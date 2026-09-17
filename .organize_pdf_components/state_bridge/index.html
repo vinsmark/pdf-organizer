@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8" /></head>
+<body>
+<script>
+  function sendMessageToStreamlitClient(type, data) {
+    var outData = Object.assign({ isStreamlitMessage: true, type: type }, data);
+    window.parent.postMessage(outData, "*");
+  }
+  function componentReady() {
+    sendMessageToStreamlitClient("streamlit:componentReady", { apiVersion: 1 });
+    sendMessageToStreamlitClient("streamlit:setFrameHeight", { height: 0 });
+  }
+  function sendValue(value) {
+    sendMessageToStreamlitClient("streamlit:setComponentValue", { value: value, dataType: "json" });
+  }
+
+  const STORAGE_KEY = "organize_pdf_state_v1";
+  let restored = false;
+
+  window.addEventListener('message', (event) => {
+    if (!event.data || event.data.type !== 'streamlit:render') return;
+    const args = event.data.args || {};
+
+    if (!restored) {
+      restored = true;
+      let existing = null;
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) existing = JSON.parse(raw);
+      } catch (e) {
+        existing = null;
+      }
+      sendValue(existing);
+    }
+
+    if (args.clear) {
+      try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+    } else if (args.state !== null && args.state !== undefined) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(args.state));
+      } catch (e) {
+        // storage full or unavailable - fail silently, app still works without persistence
+      }
+    }
+  });
+
+  componentReady();
+</script>
+</body>
+</html>
