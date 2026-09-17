@@ -1,3 +1,5 @@
+import base64
+
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
 from io import BytesIO
@@ -119,6 +121,13 @@ def render_thumbnail(pdf_bytes, page_index, max_width=200):
         return pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
     except Exception:
         return None
+
+
+def image_to_data_uri(img):
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/png;base64,{b64}"
 
 
 left, right = st.columns([3.2, 1.1], gap="large")
@@ -256,53 +265,79 @@ with left:
         unsafe_allow_html=True,
     )
 
-    # Single unified grid — each red-bordered card is itself the draggable page.
+    # Single unified grid — each red-bordered card is itself the draggable page,
+    # showing the real page thumbnail with the page number below it.
     labels = [f"{page_idx + 1}" for page_idx in order]
 
-    custom_style = """
-    .sortable-component {
-        width: 100% !important;
-    }
-    .sortable-container {
-        width: 100% !important;
-    }
-    .sortable-container-body {
-        display: flex !important;
-        flex-direction: row !important;
-        flex-wrap: wrap !important;
-        align-items: flex-start !important;
-        width: 100% !important;
-        box-sizing: border-box;
-        gap: 14px !important;
-        padding: 8px 0;
-    }
-    .sortable-item {
-        flex: 0 0 auto;
-        box-sizing: border-box;
-        background-color: #fff;
-        border: 2px solid #f43f5e;
-        border-radius: 12px;
-        width: 110px;
-        height: 140px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-family: 'Geist Mono', monospace;
-        font-size: 1.6rem;
-        font-weight: 700;
-        color: #111;
-        cursor: grab;
-        box-shadow: 0 1px 4px rgba(244,63,94,0.1);
-        transition: box-shadow 0.15s ease, background-color 0.15s ease;
-    }
-    .sortable-item:hover {
-        box-shadow: 0 6px 18px rgba(244,63,94,0.2);
-        background-color: #fff1f2;
-    }
-    .sortable-item:active {
-        cursor: grabbing;
-    }
-    """
+    nth_child_rules = []
+    for pos, page_idx in enumerate(order):
+        thumb = render_thumbnail(st.session_state.pdf_bytes, page_idx, max_width=110)
+        if thumb is not None:
+            data_uri = image_to_data_uri(thumb)
+            nth_child_rules.append(
+                f'.sortable-item:nth-child({pos + 1}) {{ background-image: url("{data_uri}"); }}'
+            )
+
+    custom_style = (
+        """
+        .sortable-component {
+            width: 100% !important;
+        }
+        .sortable-container {
+            width: 100% !important;
+            counter-reset: item;
+        }
+        .sortable-container-body {
+            display: flex !important;
+            flex-direction: row !important;
+            flex-wrap: wrap !important;
+            align-items: flex-start !important;
+            width: 100% !important;
+            box-sizing: border-box;
+            gap: 14px !important;
+            padding: 8px 0;
+        }
+        .sortable-item {
+            position: relative;
+            flex: 0 0 auto;
+            box-sizing: border-box;
+            background-color: #fff;
+            background-repeat: no-repeat;
+            background-position: center 10px;
+            background-size: 74% auto;
+            border: 2px solid #f43f5e;
+            border-radius: 12px;
+            width: 110px;
+            height: 150px;
+            color: transparent;
+            font-size: 0;
+            cursor: grab;
+            box-shadow: 0 1px 4px rgba(244,63,94,0.1);
+            transition: box-shadow 0.15s ease, background-color 0.15s ease;
+        }
+        .sortable-item::after {
+            counter-increment: item;
+            content: counter(item);
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: 8px;
+            text-align: center;
+            font-family: 'Geist Mono', monospace;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #666;
+        }
+        .sortable-item:hover {
+            box-shadow: 0 6px 18px rgba(244,63,94,0.2);
+            background-color: #fff1f2;
+        }
+        .sortable-item:active {
+            cursor: grabbing;
+        }
+        """
+        + "\n".join(nth_child_rules)
+    )
 
     sorted_labels = sort_items(
         labels,
