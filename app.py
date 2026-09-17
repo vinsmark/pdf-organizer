@@ -1,11 +1,12 @@
 import base64
+import json
 
 import streamlit as st
+import streamlit.components.v1 as components
 from pypdf import PdfReader, PdfWriter
 from io import BytesIO
 import pypdfium2 as pdfium
 from PIL import Image
-from streamlit_sortables import sort_items
 
 st.set_page_config(
     page_title="Organize PDF",
@@ -72,6 +73,17 @@ st.markdown(
         font-size: 0.85rem;
         margin: 6px 0;
     }
+    /* Hide the sync field used to receive the drag order from the component */
+    div[data-testid="stTextInput"]:has(input[aria-label="__order_sync__"]) {
+        position: absolute !important;
+        width: 1px !important;
+        height: 1px !important;
+        padding: 0 !important;
+        margin: -1px !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -83,6 +95,8 @@ if "page_order" not in st.session_state:
     st.session_state.page_order = []
 if "filename" not in st.session_state:
     st.session_state.filename = "document.pdf"
+if "order_sync_last" not in st.session_state:
+    st.session_state.order_sync_last = ""
 
 
 def load_pdf(uploaded_file):
@@ -128,6 +142,179 @@ def image_to_data_uri(img):
     img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
     return f"data:image/png;base64,{b64}"
+
+
+def build_drag_grid_html(pdf_bytes, order, thumb_width=110):
+    """Self-contained HTML5 drag-and-drop grid. Each card carries its own
+    real thumbnail image and page-index — nothing is derived from sibling
+    position, so nothing can glitch or mismatch while dragging."""
+    card_h = int(thumb_width * 1.3)
+    cards_html = []
+    for page_idx in order:
+        thumb = render_thumbnail(pdf_bytes, page_idx, max_width=thumb_width)
+        img_tag = (
+            f'<img src="{image_to_data_uri(thumb)}" draggable="false" />'
+            if thumb is not None
+            else ""
+        )
+        cards_html.append(
+            f'<div class="card" draggable="true" data-page="{page_idx}">'
+            f'<div class="thumb-wrap">{img_tag}</div>'
+            f'<div class="num"></div>'
+            f"</div>"
+        )
+    cards_joined = "\n".join(cards_html)
+
+    return f"""
+    <html>
+    <head>
+    <style>
+        html, body {{
+            margin: 0; padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: transparent;
+        }}
+        #grid {{
+            display: flex;
+            flex-direction: row;
+            flex-wrap: wrap;
+            gap: 14px;
+            padding: 4px;
+        }}
+        .card {{
+            width: {thumb_width + 20}px;
+            border: 2px solid #f43f5e;
+            border-radius: 12px;
+            background: #fff;
+            padding: 8px;
+            box-sizing: border-box;
+            text-align: center;
+            cursor: grab;
+            box-shadow: 0 1px 4px rgba(244,63,94,0.1);
+            transition: box-shadow 0.15s ease, background-color 0.15s ease, opacity 0.15s ease;
+            user-select: none;
+        }}
+        .card:hover {{
+            box-shadow: 0 6px 18px rgba(244,63,94,0.2);
+            background-color: #fff1f2;
+        }}
+        .card.dragging {{
+            opacity: 0.4;
+        }}
+        .thumb-wrap {{
+            width: 100%;
+            height: {card_h}px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }}
+        .thumb-wrap img {{
+            max-width: 100%;
+            max-height: 100%;
+            pointer-events: none;
+        }}
+        .num {{
+            margin-top: 6px;
+            font-family: 'Geist Mono', 'Courier New', monospace;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #666;
+        }}
+        #apply-btn {{
+            margin-top: 14px;
+            background-color: #111;
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            font-weight: 500;
+            padding: 10px 18px;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }}
+        #apply-btn:hover {{
+            background-color: #333;
+        }}
+        #status {{
+            display: inline-block;
+            margin-left: 10px;
+            font-size: 0.8rem;
+            color: #16a34a;
+        }}
+    </style>
+    </head>
+    <body>
+        <div id="grid">
+            {cards_joined}
+        </div>
+        <button id="apply-btn">Apply order ↓</button>
+        <span id="status"></span>
+
+        <script>
+        const grid = document.getElementById('grid');
+        let dragEl = null;
+
+        function renumber() {{
+            Array.from(grid.querySelectorAll('.card')).forEach((c, i) => {{
+                c.querySelector('.num').textContent = (i + 1);
+            }});
+        }}
+
+        Array.from(grid.querySelectorAll('.card')).forEach(card => {{
+            card.addEventListener('dragstart', () => {{
+                dragEl = card;
+                setTimeout(() => card.classList.add('dragging'), 0);
+            }});
+            card.addEventListener('dragend', () => {{
+                card.classList.remove('dragging');
+                dragEl = null;
+                renumber();
+            }});
+            card.addEventListener('dragover', (e) => {{
+                e.preventDefault();
+                if (!dragEl || dragEl === card) return;
+                const rect = card.getBoundingClientRect();
+                const before = e.clientX < rect.left + rect.width / 2;
+                grid.insertBefore(dragEl, before ? card : card.nextSibling);
+            }});
+        }});
+        grid.addEventListener('dragover', (e) => e.preventDefault());
+        grid.addEventListener('drop', (e) => e.preventDefault());
+
+        renumber();
+
+        document.getElementById('apply-btn').addEventListener('click', () => {{
+            const status = document.getElementById('status');
+            try {{
+                const cards = Array.from(grid.querySelectorAll('.card'));
+                const order = cards.map(c => c.getAttribute('data-page'));
+                const orderJson = JSON.stringify(order);
+
+                const doc = window.parent.document;
+                const input = doc.querySelector('input[aria-label="__order_sync__"]');
+                if (!input) {{
+                    status.style.color = '#dc2626';
+                    status.textContent = 'Could not sync — reload the page.';
+                    return;
+                }}
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.parent.HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(input, orderJson);
+                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                input.blur();
+                status.style.color = '#16a34a';
+                status.textContent = 'Order applied ✓';
+            }} catch (err) {{
+                status.style.color = '#dc2626';
+                status.textContent = 'Sync error: ' + err.message;
+            }}
+        }});
+        </script>
+    </body>
+    </html>
+    """
 
 
 left, right = st.columns([3.2, 1.1], gap="large")
@@ -259,104 +446,33 @@ with left:
         f"""
         <p style="color:#888;font-size:0.9rem;margin-bottom:0.8rem;">
             <i class="fa-solid fa-hand" style="margin-right:4px;"></i>
-            <strong>Drag</strong> the pages below to reorder &nbsp;·&nbsp; {n} pages
+            <strong>Drag</strong> the pages below to reorder, then click
+            <strong>Apply order</strong> &nbsp;·&nbsp; {n} pages
         </p>
         """,
         unsafe_allow_html=True,
     )
 
-    # Single unified grid — each red-bordered card is itself the draggable page,
-    # showing the real page thumbnail with the page number below it.
-    labels = [f"{page_idx + 1}" for page_idx in order]
+    # Rows needed for a rough height estimate (actual wrapping is responsive).
+    approx_cols = 8
+    rows = max(1, -(-n // approx_cols))
+    grid_height = rows * 190 + 90
 
-    nth_child_rules = []
-    for pos, page_idx in enumerate(order):
-        thumb = render_thumbnail(st.session_state.pdf_bytes, page_idx, max_width=110)
-        if thumb is not None:
-            data_uri = image_to_data_uri(thumb)
-            nth_child_rules.append(
-                f'.sortable-item:nth-child({pos + 1}) {{ background-image: url("{data_uri}"); }}'
-            )
+    grid_html = build_drag_grid_html(st.session_state.pdf_bytes, order, thumb_width=110)
+    components.html(grid_html, height=grid_height, scrolling=True)
 
-    custom_style = (
-        """
-        .sortable-component {
-            width: 100% !important;
-        }
-        .sortable-container {
-            width: 100% !important;
-            counter-reset: item;
-        }
-        .sortable-container-body {
-            display: flex !important;
-            flex-direction: row !important;
-            flex-wrap: wrap !important;
-            align-items: flex-start !important;
-            width: 100% !important;
-            box-sizing: border-box;
-            gap: 14px !important;
-            padding: 8px 0;
-        }
-        .sortable-item {
-            position: relative;
-            flex: 0 0 auto;
-            box-sizing: border-box;
-            background-color: #fff;
-            background-repeat: no-repeat;
-            background-position: center 10px;
-            background-size: 74% auto;
-            border: 2px solid #f43f5e;
-            border-radius: 12px;
-            width: 110px;
-            height: 150px;
-            color: transparent;
-            font-size: 0;
-            cursor: grab;
-            box-shadow: 0 1px 4px rgba(244,63,94,0.1);
-            transition: box-shadow 0.15s ease, background-color 0.15s ease;
-        }
-        .sortable-item::after {
-            counter-increment: item;
-            content: counter(item);
-            position: absolute;
-            left: 0;
-            right: 0;
-            bottom: 8px;
-            text-align: center;
-            font-family: 'Geist Mono', monospace;
-            font-size: 0.8rem;
-            font-weight: 600;
-            color: #666;
-        }
-        .sortable-item:hover {
-            box-shadow: 0 6px 18px rgba(244,63,94,0.2);
-            background-color: #fff1f2;
-        }
-        .sortable-item:active {
-            cursor: grabbing;
-        }
-        """
-        + "\n".join(nth_child_rules)
+    sync_value = st.text_input(
+        "__order_sync__", key="order_sync", label_visibility="collapsed"
     )
-
-    sorted_labels = sort_items(
-        labels,
-        direction="horizontal",
-        key="page_cards_sorter",
-        custom_style=custom_style,
-    )
-
-    new_order = []
-    for lab in sorted_labels:
+    if sync_value and sync_value != st.session_state.order_sync_last:
         try:
-            num = int(str(lab).strip())
-            new_order.append(num - 1)
-        except ValueError:
-            continue
-
-    if new_order and len(new_order) == len(order) and new_order != st.session_state.page_order:
-        st.session_state.page_order = new_order
-        st.rerun()
+            new_order = [int(x) for x in json.loads(sync_value)]
+            if len(new_order) == len(order) and set(new_order) == set(order):
+                st.session_state.order_sync_last = sync_value
+                st.session_state.page_order = new_order
+                st.rerun()
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
 
     st.markdown("---")
     st.markdown(
