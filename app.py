@@ -34,6 +34,7 @@ _DRAG_GRID_HTML = r"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   html, body {
     margin: 0; padding: 0;
@@ -41,11 +42,17 @@ _DRAG_GRID_HTML = r"""<!DOCTYPE html>
     background: transparent;
   }
   #grid {
-    display: flex;
-    flex-direction: row;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
     gap: 14px;
     padding: 4px;
+  }
+  /* Force exactly two cards per row on small / mobile screens */
+  @media (max-width: 520px) {
+    #grid {
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+    }
   }
   .card {
     border: 2px solid #f43f5e;
@@ -68,10 +75,12 @@ _DRAG_GRID_HTML = r"""<!DOCTYPE html>
   }
   .thumb-wrap {
     width: 100%;
+    aspect-ratio: 3 / 4;
     display: flex;
     align-items: center;
     justify-content: center;
     overflow: hidden;
+    cursor: zoom-in;
   }
   .thumb-wrap img {
     max-width: 100%;
@@ -104,12 +113,54 @@ _DRAG_GRID_HTML = r"""<!DOCTYPE html>
     margin-left: 10px;
     font-size: 0.8rem;
   }
+  #lightbox {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(17,17,17,0.85);
+    z-index: 999;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    padding: 24px;
+    box-sizing: border-box;
+  }
+  #lightbox.open { display: flex; }
+  #lightbox img {
+    max-width: 100%;
+    max-height: 80vh;
+    border-radius: 8px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+  }
+  #lightbox-caption {
+    color: #fff;
+    font-family: 'Courier New', monospace;
+    font-size: 0.85rem;
+    margin-top: 12px;
+  }
+  #lightbox-close {
+    position: absolute;
+    top: 16px;
+    right: 20px;
+    color: #fff;
+    font-size: 1.6rem;
+    background: none;
+    border: none;
+    cursor: pointer;
+    line-height: 1;
+  }
 </style>
 </head>
 <body>
   <div id="grid"></div>
   <button id="apply-btn">Apply order &darr;</button>
   <span id="status"></span>
+
+  <div id="lightbox">
+    <button id="lightbox-close" aria-label="Close">&times;</button>
+    <img id="lightbox-img" src="" />
+    <div id="lightbox-caption"></div>
+  </div>
 
   <script>
     function sendMessageToStreamlitClient(type, data) {
@@ -127,6 +178,8 @@ _DRAG_GRID_HTML = r"""<!DOCTYPE html>
     }
 
     let dragEl = null;
+    // Populated on each render: page number -> larger image src, for the zoom lightbox.
+    let zoomSrcByPage = {};
 
     function renumber() {
       Array.from(document.querySelectorAll('.card')).forEach((c, i) => {
@@ -134,6 +187,25 @@ _DRAG_GRID_HTML = r"""<!DOCTYPE html>
       });
     }
 
+    function openLightbox(pageNum, positionLabel) {
+      const src = zoomSrcByPage[pageNum];
+      if (!src) return;
+      document.getElementById('lightbox-img').src = src;
+      document.getElementById('lightbox-caption').textContent = 'Position ' + positionLabel;
+      document.getElementById('lightbox').classList.add('open');
+    }
+    function closeLightbox() {
+      document.getElementById('lightbox').classList.remove('open');
+      document.getElementById('lightbox-img').src = '';
+    }
+    document.getElementById('lightbox-close').addEventListener('click', closeLightbox);
+    document.getElementById('lightbox').addEventListener('click', (e) => {
+      if (e.target.id === 'lightbox') closeLightbox();
+    });
+
+    // Reordering is driven by whichever card is under the pointer, using
+    // elementFromPoint. This works correctly in a multi-row / multi-column
+    // grid (unlike a left/right-only check across a single flex row).
     function attachDnD() {
       const grid = document.getElementById('grid');
       Array.from(grid.querySelectorAll('.card')).forEach(card => {
@@ -147,15 +219,17 @@ _DRAG_GRID_HTML = r"""<!DOCTYPE html>
           renumber();
           updateHeight();
         });
-        card.addEventListener('dragover', (e) => {
-          e.preventDefault();
-          if (!dragEl || dragEl === card) return;
-          const rect = card.getBoundingClientRect();
-          const before = e.clientX < rect.left + rect.width / 2;
-          grid.insertBefore(dragEl, before ? card : card.nextSibling);
-        });
       });
-      grid.addEventListener('dragover', (e) => e.preventDefault());
+      grid.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        if (!dragEl) return;
+        const target = document.elementFromPoint(e.clientX, e.clientY);
+        const card = target && target.closest ? target.closest('.card') : null;
+        if (!card || card === dragEl) return;
+        const rect = card.getBoundingClientRect();
+        const beforeInRow = e.clientX < rect.left + rect.width / 2;
+        grid.insertBefore(dragEl, beforeInRow ? card : card.nextSibling);
+      });
       grid.addEventListener('drop', (e) => e.preventDefault());
     }
 
@@ -166,26 +240,31 @@ _DRAG_GRID_HTML = r"""<!DOCTYPE html>
     }
 
     function renderGrid(pages, width) {
-      const cardWidth = width || 110;
-      const cardH = Math.round(cardWidth * 1.3);
       const grid = document.getElementById('grid');
       grid.innerHTML = '';
+      zoomSrcByPage = {};
       pages.forEach(p => {
+        zoomSrcByPage[p.page] = p.zoom || p.thumb;
+
         const card = document.createElement('div');
         card.className = 'card';
         card.draggable = true;
         card.dataset.page = p.page;
-        card.style.width = (cardWidth + 20) + 'px';
 
         const thumbWrap = document.createElement('div');
         thumbWrap.className = 'thumb-wrap';
-        thumbWrap.style.height = cardH + 'px';
         if (p.thumb) {
           const img = document.createElement('img');
           img.src = p.thumb;
           img.draggable = false;
           thumbWrap.appendChild(img);
         }
+        // Click (not drag) zooms in. Native drag only fires after real
+        // pointer movement, so a plain tap/click still reaches here.
+        thumbWrap.addEventListener('click', () => {
+          const positionLabel = Array.from(grid.querySelectorAll('.card')).indexOf(card) + 1;
+          openLightbox(p.page, positionLabel);
+        });
 
         const num = document.createElement('div');
         num.className = 'num';
@@ -394,6 +473,7 @@ def get_reader():
     return PdfReader(BytesIO(st.session_state.pdf_bytes))
 
 
+@st.cache_data(show_spinner=False)
 def render_thumbnail(pdf_bytes, page_index, max_width=200):
     try:
         pdf = pdfium.PdfDocument(pdf_bytes)
@@ -563,6 +643,11 @@ with right:
 
     if st.session_state.pdf_bytes is not None:
         st.markdown("---")
+        st.checkbox(
+            "Preview final order before downloading",
+            key="show_final_preview",
+            help="Shows every page, large, in the exact order the downloaded PDF will use.",
+        )
         reader = get_reader()
         writer = PdfWriter()
         for page_idx in st.session_state.page_order:
@@ -615,14 +700,17 @@ with left:
     pages_payload = []
     for page_idx in order:
         thumb = render_thumbnail(st.session_state.pdf_bytes, page_idx, max_width=110)
+        zoom = render_thumbnail(st.session_state.pdf_bytes, page_idx, max_width=700)
         pages_payload.append(
             {
                 "page": page_idx,
                 "thumb": image_to_data_uri(thumb) if thumb is not None else None,
+                "zoom": image_to_data_uri(zoom) if zoom is not None else None,
             }
         )
 
     result = drag_grid(pages_payload, thumb_width=110, key="drag_grid_widget")
+    st.caption("Tap or click a thumbnail to zoom in and check it.")
 
     if result is not None:
         try:
@@ -671,3 +759,19 @@ with left:
         if st.button("Restore original", use_container_width=True):
             st.session_state.page_order = list(range(len(get_reader().pages)))
             st.rerun()
+
+    if st.session_state.get("show_final_preview"):
+        st.markdown("---")
+        st.markdown(
+            '<p style="font-weight:600;margin-bottom:0.6rem;font-size:0.95rem;">'
+            '<i class="fa-solid fa-eye" style="margin-right:6px;"></i>'
+            "Final order preview — exactly what will download</p>",
+            unsafe_allow_html=True,
+        )
+        preview_cols = st.columns(2)
+        for i, page_idx in enumerate(st.session_state.page_order):
+            large = render_thumbnail(st.session_state.pdf_bytes, page_idx, max_width=700)
+            with preview_cols[i % 2]:
+                if large is not None:
+                    st.image(large, use_container_width=True)
+                st.caption(f"Page {i + 1}  ·  originally page {page_idx + 1}")
