@@ -255,7 +255,9 @@ _STATE_BRIDGE_HTML = r"""<!DOCTYPE html>
       } catch (e) {
         existing = null;
       }
-      sendValue(existing);
+      // Wrapped so Python can tell "checked, found nothing" (data: null)
+      // apart from "component hasn't answered yet" (the raw default None).
+      sendValue({ status: "restored", data: existing });
     }
 
     if (args.clear) {
@@ -374,6 +376,8 @@ if "filename" not in st.session_state:
     st.session_state.filename = "document.pdf"
 if "hydrated" not in st.session_state:
     st.session_state.hydrated = False
+if "pending_clear" not in st.session_state:
+    st.session_state.pending_clear = False
 
 
 def load_pdf(uploaded_file):
@@ -425,6 +429,17 @@ def image_to_data_uri(img):
 # Persistence: restore once on a fresh session, then keep localStorage synced
 # with the current state on every rerun so a full page reload isn't a reset.
 # ---------------------------------------------------------------------------
+# If "Clear saved copy" was just clicked, do the reset now (before building
+# this run's persist payload) and tell the *already-mounted* bridge to clear
+# localStorage in this same message — no fresh component instance, so there's
+# no load-timing race with the rerun.
+_do_clear = st.session_state.pending_clear
+if _do_clear:
+    st.session_state.pending_clear = False
+    st.session_state.pdf_bytes = None
+    st.session_state.page_order = []
+    st.session_state.filename = "document.pdf"
+
 _persist_state = None
 if st.session_state.pdf_bytes is not None:
     _persist_state = {
@@ -433,20 +448,25 @@ if st.session_state.pdf_bytes is not None:
         "page_order": st.session_state.page_order,
     }
 
-_restored = state_bridge(state=_persist_state, key="state_bridge_widget")
+_bridge_result = state_bridge(state=_persist_state, clear=_do_clear, key="state_bridge_widget")
 
-if not st.session_state.hydrated:
+# _bridge_result is None until the component has actually checked localStorage
+# and reported back (that first answer arrives a moment after the very first
+# script run and triggers its own automatic rerun) — so only give up waiting
+# once we've received the real wrapped answer, not on the initial placeholder.
+if not st.session_state.hydrated and isinstance(_bridge_result, dict):
     st.session_state.hydrated = True
-    if _restored and st.session_state.pdf_bytes is None:
+    restored_data = _bridge_result.get("data")
+    if restored_data and st.session_state.pdf_bytes is None:
         try:
-            pdf_bytes = base64.b64decode(_restored["pdf_b64"])
+            pdf_bytes = base64.b64decode(restored_data["pdf_b64"])
             reader = PdfReader(BytesIO(pdf_bytes))
             n_pages = len(reader.pages)
-            saved_order = _restored.get("page_order")
+            saved_order = restored_data.get("page_order")
             if not (isinstance(saved_order, list) and set(saved_order) == set(range(n_pages))):
                 saved_order = list(range(n_pages))
             st.session_state.pdf_bytes = pdf_bytes
-            st.session_state.filename = _restored.get("filename", "document.pdf")
+            st.session_state.filename = restored_data.get("filename", "document.pdf")
             st.session_state.page_order = saved_order
             st.rerun()
         except Exception:
@@ -499,10 +519,7 @@ with right:
             st.rerun()
 
         if st.button("Clear saved copy", use_container_width=True, key="clear_saved_btn"):
-            state_bridge(clear=True, key="state_bridge_clear")
-            st.session_state.pdf_bytes = None
-            st.session_state.page_order = []
-            st.session_state.filename = "document.pdf"
+            st.session_state.pending_clear = True
             st.rerun()
 
     st.markdown("---")
@@ -631,7 +648,7 @@ with left:
     to_delete = []
     for i, page_idx in enumerate(order):
         with del_cols[i % num_cols]:
-            if st.checkbox(f"p{page_idx + 1}", key=f"del_{page_idx}"):
+            if st.checkbox(f"p{i + 1}", key=f"del_{page_idx}"):
                 to_delete.append(page_idx)
 
     if to_delete:

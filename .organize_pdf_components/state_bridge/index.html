@@ -31,7 +31,9 @@
       } catch (e) {
         existing = null;
       }
-      sendValue(existing);
+      // Wrapped so Python can tell "checked, found nothing" (data: null)
+      // apart from "component hasn't answered yet" (the raw default None).
+      sendValue({ status: "restored", data: existing });
     }
 
     if (args.clear) {
